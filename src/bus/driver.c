@@ -24,9 +24,25 @@
 #include "util/selinux.h"
 #include "util/string.h"
 
+typedef struct DriverCredentials DriverCredentials;
 typedef struct DriverInterface DriverInterface;
 typedef struct DriverMethod DriverMethod;
 typedef int (*DriverMethodFn) (Peer *peer, const char *path, CDVar *var_in, uint32_t serial, CDVar *var_out);
+
+struct DriverCredentials {
+        pid_t pid;
+        int pid_fd;
+        uid_t uid;
+        gid_t *gids;
+        size_t n_gids;
+        const char *seclabel;
+        size_t n_seclabel;
+};
+
+#define DRIVER_CREDENTIALS_NULL {       \
+                .pid_fd = -1,           \
+                .uid = -1,              \
+        }
 
 struct DriverMethod {
         const char *name;
@@ -35,6 +51,7 @@ struct DriverMethod {
         DriverMethodFn fn;
         const CDVarType *in;
         const CDVarType *out;
+        bool writes_own_header;
 };
 
 struct DriverInterface {
@@ -274,7 +291,7 @@ static int driver_dvar_verify_signature_in(const CDVarType *type, const char *si
         return 0;
 }
 
-static void driver_write_reply_header(CDVar *var, Peer *peer, uint32_t serial, const CDVarType *type) {
+static void driver_write_reply_header(CDVar *var, Peer *peer, uint32_t serial, const CDVarType *type, size_t n_fds) {
         c_dvar_write(var, "(yyyyuu[(y<u>)(y<s>)(y<",
                      c_dvar_is_big_endian(var) ? 'B' : 'l', DBUS_MESSAGE_TYPE_METHOD_RETURN, DBUS_HEADER_FLAG_NO_REPLY_EXPECTED, 1, 0, (uint32_t)-1,
                      DBUS_MESSAGE_FIELD_REPLY_SERIAL, c_dvar_type_u, serial,
@@ -284,7 +301,10 @@ static void driver_write_reply_header(CDVar *var, Peer *peer, uint32_t serial, c
         c_dvar_write(var, ">)(y<",
                      DBUS_MESSAGE_FIELD_SIGNATURE, c_dvar_type_g);
         driver_dvar_write_signature_out(var, type);
-        c_dvar_write(var, ">)])");
+        c_dvar_write(var, ">)");
+        if (n_fds > 0)
+                c_dvar_write(var, "(y<u>)", DBUS_MESSAGE_FIELD_UNIX_FDS, c_dvar_type_u, n_fds);
+        c_dvar_write(var, "])");
 }
 
 static void driver_write_signal_header(CDVar *var, Peer *peer, const char *member, const char *signature) {
@@ -473,11 +493,13 @@ static int driver_send_error(Peer *receiver, uint32_t serial, const char *error,
         return 0;
 }
 
-static int driver_send_reply(Peer *peer, CDVar *var, uint32_t serial) {
+static int driver_send_reply_with_fds(Peer *peer, CDVar *var, uint32_t serial, int *fds, size_t n_fds) {
         _c_cleanup_(message_unrefp) Message *message = NULL;
         _c_cleanup_(c_freep) void *data = NULL;
         size_t n_data;
         int r;
+
+        c_assert(fds || n_fds == 0);
 
         /*
          * The message was correctly handled and the reply is serialized in
@@ -501,11 +523,21 @@ static int driver_send_reply(Peer *peer, CDVar *var, uint32_t serial) {
                 return error_fold(r);
         data = NULL;
 
+        if (n_fds > 0) {
+                r = fdlist_new_with_fds(&message->fds, fds, n_fds);
+                if (r)
+                        return error_fold(r);
+        }
+
         r = driver_send_unicast(peer, message);
         if (r)
                 return error_trace(r);
 
         return 0;
+}
+
+static int driver_send_reply(Peer *peer, CDVar *var, uint32_t serial) {
+        return driver_send_reply_with_fds(peer, var, serial, NULL, 0);
 }
 
 static int driver_notify_name_acquired(Peer *peer, const char *name) {
@@ -796,7 +828,7 @@ static int driver_name_activated(Activation *activation, Peer *receiver) {
 
                         c_dvar_begin_write(&var, (__BYTE_ORDER == __BIG_ENDIAN), driver_type_out_u, 1);
                         c_dvar_write(&var, "(");
-                        driver_write_reply_header(&var, sender, request->serial, driver_type_out_u);
+                        driver_write_reply_header(&var, sender, request->serial, driver_type_out_u, /* n_fds= */ 0);
                         c_dvar_write(&var, "(u)", DBUS_START_REPLY_SUCCESS);
 
                         r = driver_send_reply(sender, &var, request->serial);
@@ -1325,39 +1357,44 @@ static int driver_method_get_connection_unix_process_id(Peer *peer, const char *
         return 0;
 }
 
-static void driver_append_connection_credentials(CDVar *v, Bus *bus, Peer *peer) {
-        const char *seclabel;
-        size_t n_seclabel, n_gids;
-        gid_t *gids;
-        uid_t uid;
-        pid_t pid;
-
+static void driver_fetch_credentials(Bus *bus, Peer *peer, DriverCredentials *credp) {
         if (peer) {
-                uid = peer->user->uid;
-                pid = peer->pid;
-                gids = peer->gids;
-                n_gids = peer->n_gids;
-                seclabel = peer->seclabel;
-                n_seclabel = peer->n_seclabel;
+                credp->pid = peer->pid;
+                credp->pid_fd = peer->pid_fd;
+                credp->uid = peer->user->uid;
+                credp->gids = peer->gids;
+                credp->n_gids = peer->n_gids;
+                credp->seclabel = peer->seclabel;
+                credp->n_seclabel = peer->n_seclabel;
         } else {
-                uid = bus->user->uid;
-                pid = bus->pid;
-                gids = bus->gids;
-                n_gids = bus->n_gids;
-                seclabel = bus->seclabel;
-                n_seclabel = bus->n_seclabel;
+                credp->pid = bus->pid;
+                credp->pid_fd = bus->pid_fd;
+                credp->uid = bus->user->uid;
+                credp->gids = bus->gids;
+                credp->n_gids = bus->n_gids;
+                credp->seclabel = bus->seclabel;
+                credp->n_seclabel = bus->n_seclabel;
         }
+}
 
-        c_dvar_write(v, "[{s<u>}{s<u>}",
-                     "UnixUserID", c_dvar_type_u, uid,
-                     "ProcessID", c_dvar_type_u, pid);
+static void driver_append_credentials(CDVar *v, const DriverCredentials *cred, size_t *fd_iter) {
+        c_dvar_write(v, "[");
+
+        if (cred->uid != (uid_t)-1)
+                c_dvar_write(v, "{s<u>}", "UnixUserID", c_dvar_type_u, cred->uid);
+        if (cred->pid != 0)
+                c_dvar_write(v, "{s<u>}", "ProcessID", c_dvar_type_u, cred->pid);
 
         /*
          * Append all groups of the peer as 'UnixGroupIDs'. This list includes
          * the primary group of the peer. Furthermore, it is sorted and
          * deduplicated, so its behavior is deterministic.
+         *
+         * Note that this also implies that the list cannot be empty, since the
+         * primary group must exist. So if the list is present, it has at least
+         * one element.
          */
-        {
+        if (cred->n_gids > 0) {
                 static const CDVarType type_au[] = {
                         C_DVAR_T_INIT(
                                 C_DVAR_T_ARRAY(
@@ -1367,12 +1404,12 @@ static void driver_append_connection_credentials(CDVar *v, Bus *bus, Peer *peer)
                 };
 
                 c_dvar_write(v, "{s<[", "UnixGroupIDs", type_au);
-                for (size_t i = 0; i < n_gids; ++i)
-                        c_dvar_write(v, "u", gids[i]);
+                for (size_t i = 0; i < cred->n_gids; ++i)
+                        c_dvar_write(v, "u", cred->gids[i]);
                 c_dvar_write(v, "]>}");
         }
 
-        if (n_seclabel) {
+        if (cred->n_seclabel) {
                 /*
                  * The DBus specification says that the security-label is a
                  * byte array of non-0 values. The kernel disagrees.
@@ -1380,20 +1417,28 @@ static void driver_append_connection_credentials(CDVar *v, Bus *bus, Peer *peer)
                  * rules. Hence, we simply ignore that part of the spec and
                  * insert the label unmodified, followed by a zero byte, which
                  * is mandated by the spec.
-                 * The @peer->seclabel field always has a trailing zero-byte,
+                 * Our seclabel-fields always have a trailing zero-byte,
                  * so we can safely copy from it.
                  */
                 c_dvar_write(v, "{s<", "LinuxSecurityLabel", (const CDVarType[]){ C_DVAR_T_INIT(C_DVAR_T_ARRAY(C_DVAR_T_y)) });
-                driver_write_bytes(v, seclabel, n_seclabel + 1);
+                driver_write_bytes(v, cred->seclabel, cred->n_seclabel + 1);
                 c_dvar_write(v, ">}");
+        }
+
+        if (fd_iter && cred->pid_fd >= 0) {
+                /* If @fd_iter is set, it must refer to the pidfd. */
+                c_dvar_write(v, "{s<h>}", "ProcessFD", c_dvar_type_h, *fd_iter);
+                ++*fd_iter;
         }
 
         c_dvar_write(v, "]");
 }
 
 static int driver_method_get_connection_credentials(Peer *peer, const char *path, CDVar *in_v, uint32_t serial, CDVar *out_v) {
+        DriverCredentials cred = DRIVER_CREDENTIALS_NULL;
         Peer *connection = NULL;
         const char *name;
+        size_t n_fds = 0;
         int r;
 
         c_dvar_read(in_v, "(s)", &name);
@@ -1408,11 +1453,19 @@ static int driver_method_get_connection_credentials(Peer *peer, const char *path
                         return DRIVER_E_PEER_NOT_FOUND;
         }
 
+        driver_write_reply_header(out_v, peer, serial, driver_type_out_apsv, n_fds);
+
         c_dvar_write(out_v, "(");
-        driver_append_connection_credentials(out_v, peer->bus, connection);
+        driver_fetch_credentials(peer->bus, connection, &cred);
+        driver_append_credentials(out_v, &cred, &n_fds);
         c_dvar_write(out_v, ")");
 
-        r = driver_send_reply(peer, out_v, serial);
+        c_assert(n_fds == 0 || n_fds == 1);
+
+        if (n_fds == 1)
+                r = driver_send_reply_with_fds(peer, out_v, serial, &cred.pid_fd, n_fds);
+        else
+                r = driver_send_reply(peer, out_v, serial);
         if (r)
                 return error_trace(r);
 
@@ -1558,7 +1611,7 @@ int driver_reload_config_completed(Bus *bus, uint64_t sender_id, uint32_t reply_
 
                 c_dvar_begin_write(&var, (__BYTE_ORDER == __BIG_ENDIAN), driver_type_out_unit, 1);
                 c_dvar_write(&var, "(");
-                driver_write_reply_header(&var, sender, reply_serial, driver_type_out_unit);
+                driver_write_reply_header(&var, sender, reply_serial, driver_type_out_unit, /* n_fds=*/ 0);
                 c_dvar_write(&var, "()");
 
                 r = driver_send_reply(sender, &var, reply_serial);
@@ -2132,12 +2185,15 @@ static void driver_append_peer_accounting(CDVar *v, Bus *bus) {
         c_dvar_write(v, "<[", dump_type);
 
         c_rbtree_for_each_entry(p, &bus->peers.peer_tree, registry_node) {
+                DriverCredentials cred = DRIVER_CREDENTIALS_NULL;
+
                 if (!peer_is_registered(p))
                         continue;
 
                 c_dvar_write(v, "(");
                 driver_dvar_write_unique_name(v, p);
-                driver_append_connection_credentials(v, bus, p);
+                driver_fetch_credentials(bus, p, &cred);
+                driver_append_credentials(v, &cred, NULL);
                 driver_append_peer_accounting_stats(v, p);
                 c_dvar_write(v, ")");
         }
@@ -2266,16 +2322,19 @@ static int driver_handle_method(const DriverMethod *method, Peer *peer, const ch
         c_dvar_begin_write(&var_out, (__BYTE_ORDER == __BIG_ENDIAN), method->out, 1);
 
         /*
-         * Write the generic reply-header and then call into the method-handler
-         * of the specific driver method. Note that the driver-methods are
-         * responsible to call c_dvar_end_read(var_in), to assert that all read
-         * data was correct. We already verify that the payload matches the
-         * signature, and that the signature matches the method call, so this
-         * is just to catch programming errors in the broker.
+         * Note that some driver-methods are responsible for writing the
+         * reply-header, given they might need to send file descriptors, which
+         * needs a specific count field to be added.
+         * They all are responsible for calling c_dvar_end_read(var_in), to
+         * assert that all read data was correct.
+         * We already verify that the payload matches the signature, and that
+         * the signature matches the method call, so this is just to catch
+         * programming errors in the broker.
          */
 
         c_dvar_write(&var_out, "(");
-        driver_write_reply_header(&var_out, peer, serial, method->out);
+        if (!method->writes_own_header)
+                driver_write_reply_header(&var_out, peer, serial, method->out, /* n_fds= */ 0);
 
         r = method->fn(peer, path, &var_in, serial, &var_out);
         if (r)
@@ -2285,55 +2344,55 @@ static int driver_handle_method(const DriverMethod *method, Peer *peer, const ch
 }
 
 static const DriverMethod driver_methods[] = {
-        { "Hello",                                      false,  NULL,                           driver_method_hello,                                            c_dvar_type_unit,       driver_type_out_s },
-        { "AddMatch",                                   true,   NULL,                           driver_method_add_match,                                        driver_type_in_s,       driver_type_out_unit },
-        { "RemoveMatch",                                true,   NULL,                           driver_method_remove_match,                                     driver_type_in_s,       driver_type_out_unit },
-        { "RequestName",                                true,   NULL,                           driver_method_request_name,                                     driver_type_in_su,      driver_type_out_u },
-        { "ReleaseName",                                true,   NULL,                           driver_method_release_name,                                     driver_type_in_s,       driver_type_out_u },
-        { "GetConnectionCredentials",                   true,   NULL,                           driver_method_get_connection_credentials,                       driver_type_in_s,       driver_type_out_apsv },
-        { "GetConnectionUnixUser",                      true,   NULL,                           driver_method_get_connection_unix_user,                         driver_type_in_s,       driver_type_out_u },
-        { "GetConnectionUnixProcessID",                 true,   NULL,                           driver_method_get_connection_unix_process_id,                   driver_type_in_s,       driver_type_out_u },
-        { "GetAdtAuditSessionData",                     true,   NULL,                           driver_method_get_adt_audit_session_data,                       driver_type_in_s,       driver_type_out_ay },
-        { "GetConnectionSELinuxSecurityContext",        true,   NULL,                           driver_method_get_connection_selinux_security_context,          driver_type_in_s,       driver_type_out_ay },
-        { "StartServiceByName",                         true,   NULL,                           driver_method_start_service_by_name,                            driver_type_in_su,      driver_type_out_u },
-        { "ListQueuedOwners",                           true,   NULL,                           driver_method_list_queued_owners,                               driver_type_in_s,       driver_type_out_as },
-        { "ListNames",                                  true,   NULL,                           driver_method_list_names,                                       c_dvar_type_unit,       driver_type_out_as },
-        { "ListActivatableNames",                       true,   NULL,                           driver_method_list_activatable_names,                           c_dvar_type_unit,       driver_type_out_as },
-        { "NameHasOwner",                               true,   NULL,                           driver_method_name_has_owner,                                   driver_type_in_s,       driver_type_out_b },
-        { "UpdateActivationEnvironment",                true,   "/org/freedesktop/DBus",        driver_method_update_activation_environment,                    driver_type_in_apss,    driver_type_out_unit },
-        { "GetNameOwner",                               true,   NULL,                           driver_method_get_name_owner,                                   driver_type_in_s,       driver_type_out_s },
-        { "ReloadConfig",                               true,   NULL,                           driver_method_reload_config,                                    c_dvar_type_unit,       driver_type_out_unit },
-        { "GetId",                                      true,   NULL,                           driver_method_get_id,                                           c_dvar_type_unit,       driver_type_out_s },
+        { "Hello",                                      false,  NULL,                           driver_method_hello,                                            c_dvar_type_unit,       driver_type_out_s,     false },
+        { "AddMatch",                                   true,   NULL,                           driver_method_add_match,                                        driver_type_in_s,       driver_type_out_unit,  false },
+        { "RemoveMatch",                                true,   NULL,                           driver_method_remove_match,                                     driver_type_in_s,       driver_type_out_unit,  false },
+        { "RequestName",                                true,   NULL,                           driver_method_request_name,                                     driver_type_in_su,      driver_type_out_u,     false },
+        { "ReleaseName",                                true,   NULL,                           driver_method_release_name,                                     driver_type_in_s,       driver_type_out_u,     false },
+        { "GetConnectionCredentials",                   true,   NULL,                           driver_method_get_connection_credentials,                       driver_type_in_s,       driver_type_out_apsv,  true  },
+        { "GetConnectionUnixUser",                      true,   NULL,                           driver_method_get_connection_unix_user,                         driver_type_in_s,       driver_type_out_u,     false },
+        { "GetConnectionUnixProcessID",                 true,   NULL,                           driver_method_get_connection_unix_process_id,                   driver_type_in_s,       driver_type_out_u,     false },
+        { "GetAdtAuditSessionData",                     true,   NULL,                           driver_method_get_adt_audit_session_data,                       driver_type_in_s,       driver_type_out_ay,    false },
+        { "GetConnectionSELinuxSecurityContext",        true,   NULL,                           driver_method_get_connection_selinux_security_context,          driver_type_in_s,       driver_type_out_ay,    false },
+        { "StartServiceByName",                         true,   NULL,                           driver_method_start_service_by_name,                            driver_type_in_su,      driver_type_out_u,     false },
+        { "ListQueuedOwners",                           true,   NULL,                           driver_method_list_queued_owners,                               driver_type_in_s,       driver_type_out_as,    false },
+        { "ListNames",                                  true,   NULL,                           driver_method_list_names,                                       c_dvar_type_unit,       driver_type_out_as,    false },
+        { "ListActivatableNames",                       true,   NULL,                           driver_method_list_activatable_names,                           c_dvar_type_unit,       driver_type_out_as,    false },
+        { "NameHasOwner",                               true,   NULL,                           driver_method_name_has_owner,                                   driver_type_in_s,       driver_type_out_b,     false },
+        { "UpdateActivationEnvironment",                true,   "/org/freedesktop/DBus",        driver_method_update_activation_environment,                    driver_type_in_apss,    driver_type_out_unit,  false },
+        { "GetNameOwner",                               true,   NULL,                           driver_method_get_name_owner,                                   driver_type_in_s,       driver_type_out_s,     false },
+        { "ReloadConfig",                               true,   NULL,                           driver_method_reload_config,                                    c_dvar_type_unit,       driver_type_out_unit,  false },
+        { "GetId",                                      true,   NULL,                           driver_method_get_id,                                           c_dvar_type_unit,       driver_type_out_s,     false },
         { },
 };
 
 static const DriverMethod monitoring_methods[] = {
-        { "BecomeMonitor",                              true,   "/org/freedesktop/DBus",        driver_method_become_monitor,                                   driver_type_in_asu,     driver_type_out_unit },
+        { "BecomeMonitor",                              true,   "/org/freedesktop/DBus",        driver_method_become_monitor,                                   driver_type_in_asu,     driver_type_out_unit,  false },
         { },
 };
 
 static const DriverMethod introspectable_methods[] = {
-        { "Introspect",                                 true,   NULL,                           driver_method_introspect,                                       c_dvar_type_unit,       driver_type_out_s },
+        { "Introspect",                                 true,   NULL,                           driver_method_introspect,                                       c_dvar_type_unit,       driver_type_out_s,     false },
         { },
 };
 
 static const DriverMethod peer_methods[] = {
-        { "Ping",                                       true,   NULL,                           driver_method_ping,                                             c_dvar_type_unit,       driver_type_out_unit },
-        { "GetMachineId",                               true,   NULL,                           driver_method_get_machine_id,                                   c_dvar_type_unit,       driver_type_out_s },
+        { "Ping",                                       true,   NULL,                           driver_method_ping,                                             c_dvar_type_unit,       driver_type_out_unit,  false },
+        { "GetMachineId",                               true,   NULL,                           driver_method_get_machine_id,                                   c_dvar_type_unit,       driver_type_out_s,     false },
         { },
 };
 
 static const DriverMethod properties_methods[] = {
-        { "Get",                                        true,   "/org/freedesktop/DBus",        driver_method_get,                                              driver_type_in_ss,      driver_type_out_v },
-        { "Set",                                        true,   "/org/freedesktop/DBus",        driver_method_set,                                              driver_type_in_ssv,     driver_type_out_unit },
-        { "GetAll",                                     true,   "/org/freedesktop/DBus",        driver_method_get_all,                                          driver_type_in_s,       driver_type_out_apsv },
+        { "Get",                                        true,   "/org/freedesktop/DBus",        driver_method_get,                                              driver_type_in_ss,      driver_type_out_v,     false },
+        { "Set",                                        true,   "/org/freedesktop/DBus",        driver_method_set,                                              driver_type_in_ssv,     driver_type_out_unit,  false },
+        { "GetAll",                                     true,   "/org/freedesktop/DBus",        driver_method_get_all,                                          driver_type_in_s,       driver_type_out_apsv,  false },
         { },
 };
 
 static const DriverMethod debug_stats_methods[] = {
-        { "GetStats",                                   true,   "/org/freedesktop/DBus",        driver_method_get_stats,                                        c_dvar_type_unit,       driver_type_out_apsv },
-        { "GetConnectionStats",                         true,   "/org/freedesktop/DBus",        driver_method_get_connection_stats,                             driver_type_in_s,       driver_type_out_apsv },
-        { "GetAllMatchRules",                           true,   "/org/freedesktop/DBus",        driver_method_get_all_match_rules,                              c_dvar_type_unit,       driver_type_out_apsas },
+        { "GetStats",                                   true,   "/org/freedesktop/DBus",        driver_method_get_stats,                                        c_dvar_type_unit,       driver_type_out_apsv,  false },
+        { "GetConnectionStats",                         true,   "/org/freedesktop/DBus",        driver_method_get_connection_stats,                             driver_type_in_s,       driver_type_out_apsv,  false },
+        { "GetAllMatchRules",                           true,   "/org/freedesktop/DBus",        driver_method_get_all_match_rules,                              c_dvar_type_unit,       driver_type_out_apsas, false },
         { },
 };
 
